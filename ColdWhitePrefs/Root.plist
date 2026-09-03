@@ -46,14 +46,6 @@
             <key>footerText</key>
             <string>0 = 原厂，数值越高越冷白</string>
         </dict>
-        <dict>
-            <key>cell</key>
-            <string>PSButtonCell</string>
-            <key>label</key>
-            <string>恢复原厂</string>
-            <key>action</key>
-            <string>reset:</string>
-        </dict>
     </array>
 </dict>
 </plist>
