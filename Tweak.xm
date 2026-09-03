@@ -1,28 +1,47 @@
 #import <UIKit/UIKit.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <dlfcn.h>
+#import <mach/mach.h>
 
 static NSString * const kDomain = @"com.chatgpt.coldwhite";
 
-#define kGammaCount 256
+// ========== IOMobileFramebuffer 正确的类型和函数签名 ==========
+typedef struct __IOMobileFramebuffer *IOMobileFramebufferRef;
+typedef int IOMobileFramebufferReturn;
 
-// ========== IOMobileFramebuffer 私有函数声明 ==========
-typedef void *IOMobileFramebufferRef;
+// Gamma table 结构体（关键！）
+typedef struct {
+    uint32_t channelCount;  // 3 = RGB
+    uint32_t dataCount;     // 256
+    uint32_t dataWidth;     // 32 = float
+    void *data;             // 指向实际数据
+} IOMobileFramebufferGammaTable;
 
-typedef int (*IOFBSetGammaTableFunc)(
-    IOMobileFramebufferRef connection,
-    unsigned int entryCount,
-    const float *redTable,
-    const float *greenTable,
-    const float *blueTable
+typedef IOMobileFramebufferReturn (*IOFBOpenFunc)(
+    mach_port_t servicePort,
+    task_port_t owningTask,
+    unsigned int type,
+    IOMobileFramebufferRef *connection
 );
 
-typedef IOMobileFramebufferRef (*IOFBGetMainDisplayFunc)(void);
+typedef IOMobileFramebufferReturn (*IOFBSetGammaTableFunc)(
+    IOMobileFramebufferRef connection,
+    const IOMobileFramebufferGammaTable *table
+);
 
-static IOFBSetGammaTableFunc   s_setGammaTable = NULL;
-static IOFBGetMainDisplayFunc   s_getMainDisplay = NULL;
-static IOMobileFramebufferRef   s_fbConnection = NULL;
-static BOOL                     s_hwGammaAvailable = NO;
+typedef mach_port_t (*IOServiceGetMatchingServiceFunc)(
+    mach_port_t mainPort,
+    CFDictionaryRef matching
+);
+
+typedef CFDictionaryRef (*IOServiceMatchingFunc)(const char *name);
+
+static IOFBOpenFunc                  s_openFB = NULL;
+static IOFBSetGammaTableFunc         s_setGammaTable = NULL;
+static IOServiceGetMatchingServiceFunc s_getService = NULL;
+static IOServiceMatchingFunc          s_matching = NULL;
+static IOMobileFramebufferRef         s_connection = NULL;
+static BOOL                           s_hwAvailable = NO;
 
 // ========== 全屏窗口降级 ==========
 static UIWindow *g_overlayWindow = nil;
@@ -31,7 +50,7 @@ static CGFloat clampv(CGFloat x, CGFloat a, CGFloat b) {
     return MIN(MAX(x, a), b);
 }
 
-// ========== 初始化 ==========
+// ========== 初始化（正确方式：IOServiceGetMatchingService + IOMobileFramebufferOpen） ==========
 static void initHardwareGamma(void) {
     void *handle = dlopen(
         "/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/IOMobileFramebuffer",
@@ -39,54 +58,79 @@ static void initHardwareGamma(void) {
     );
     if (!handle) return;
 
-    s_setGammaTable  = (IOFBSetGammaTableFunc)dlsym(handle, "IOMobileFramebufferSetGammaTable");
-    s_getMainDisplay = (IOFBGetMainDisplayFunc)dlsym(handle, "IOMobileFramebufferGetMainDisplay");
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (!iokit) return;
 
-    if (s_getMainDisplay) {
-        s_fbConnection = s_getMainDisplay();
-    }
+    s_openFB        = (IOFBOpenFunc)dlsym(handle, "IOMobileFramebufferOpen");
+    s_setGammaTable = (IOFBSetGammaTableFunc)dlsym(handle, "IOMobileFramebufferSetGammaTable");
+    s_getService    = (IOServiceGetMatchingServiceFunc)dlsym(iokit, "IOServiceGetMatchingService");
+    s_matching      = (IOServiceMatchingFunc)dlsym(iokit, "IOServiceMatching");
 
-    s_hwGammaAvailable = (s_setGammaTable != NULL && s_fbConnection != NULL);
+    if (!s_openFB || !s_setGammaTable || !s_getService || !s_matching) return;
+
+    // 找到 AppleCLCD 显示服务
+    mach_port_t service = s_getService(0, s_matching("AppleCLCD"));
+    if (!service) return;
+
+    // 打开 connection
+    IOMobileFramebufferReturn kr = s_openFB(service, mach_task_self(), 0, &s_connection);
+    if (kr != 0 || !s_connection) return;
+
+    s_hwAvailable = YES;
 }
 
-// ========== 硬件 Gamma（冷白：降红、微提蓝、绿不动） ==========
+// ========== 硬件 Gamma（正确调用方式） ==========
 static BOOL applyHardwareGamma(CGFloat intensity) {
-    if (!s_hwGammaAvailable) return NO;
+    if (!s_hwAvailable) return NO;
 
     CGFloat k = clampv(intensity, 0, 100) / 100.0;
 
-    // 冷白参数：降红 20%，蓝只提 10%，绿不动
-    // 这样白色更白，但不会明显变蓝
+    // 冷白参数：降红、微提蓝、绿不动
     CGFloat redScale   = 1.0 - 0.20 * k;
     CGFloat greenScale = 1.0;
     CGFloat blueScale  = 1.0 + 0.10 * k;
 
-    float r[kGammaCount], g[kGammaCount], b[kGammaCount];
-    for (int i = 0; i < kGammaCount; i++) {
-        CGFloat val = (CGFloat)i / (kGammaCount - 1);
-        r[i] = clampv(val * redScale,   0, 1);
-        g[i] = clampv(val * greenScale, 0, 1);
-        b[i] = clampv(val * blueScale,  0, 1);
+    // 构造 gamma 数据：256 个条目，每个条目是 RGB 三个 float（交错）
+    static float data[256 * 3];
+    for (int i = 0; i < 256; i++) {
+        CGFloat val = (CGFloat)i / 255.0;
+        data[i * 3 + 0] = clampv(val * redScale,   0, 1);
+        data[i * 3 + 1] = clampv(val * greenScale, 0, 1);
+        data[i * 3 + 2] = clampv(val * blueScale,  0, 1);
     }
 
-    int kr = s_setGammaTable(s_fbConnection, kGammaCount, r, g, b);
+    IOMobileFramebufferGammaTable table;
+    table.channelCount = 3;
+    table.dataCount = 256;
+    table.dataWidth = 32;  // float = 32 bit
+    table.data = data;
+
+    IOMobileFramebufferReturn kr = s_setGammaTable(s_connection, &table);
     return (kr == 0);
 }
 
 static BOOL restoreHardwareGamma(void) {
-    if (!s_hwGammaAvailable) return NO;
+    if (!s_hwAvailable) return NO;
 
-    float r[kGammaCount], g[kGammaCount], b[kGammaCount];
-    for (int i = 0; i < kGammaCount; i++) {
-        CGFloat val = (CGFloat)i / (kGammaCount - 1);
-        r[i] = g[i] = b[i] = val;
+    static float data[256 * 3];
+    for (int i = 0; i < 256; i++) {
+        CGFloat val = (CGFloat)i / 255.0;
+        data[i * 3 + 0] = val;
+        data[i * 3 + 1] = val;
+        data[i * 3 + 2] = val;
     }
 
-    int kr = s_setGammaTable(s_fbConnection, kGammaCount, r, g, b);
+    IOMobileFramebufferGammaTable table;
+    table.channelCount = 3;
+    table.dataCount = 256;
+    table.dataWidth = 32;
+    table.data = data;
+
+    IOMobileFramebufferReturn kr = s_setGammaTable(s_connection, &table);
     return (kr == 0);
 }
 
-// ========== 窗口降级（极低透明度，避免变蓝） ==========
+// ========== 窗口降级 ==========
 static void applyOverlayGamma(CGFloat intensity) {
     CGFloat k = clampv(intensity, 0, 100) / 100.0;
 
@@ -95,6 +139,7 @@ static void applyOverlayGamma(CGFloat intensity) {
         g_overlayWindow.windowLevel = UIWindowLevelAlert + 1000;
         g_overlayWindow.userInteractionEnabled = NO;
         g_overlayWindow.rootViewController = [UIViewController new];
+        g_overlayWindow.hidden = YES;
     }
 
     if (k < 0.01) {
@@ -103,9 +148,8 @@ static void applyOverlayGamma(CGFloat intensity) {
     }
 
     g_overlayWindow.hidden = NO;
-    // 最大 10% 透明度的淡蓝，只去黄不变蓝
-    CGFloat alpha = k * 0.10;
-    g_overlayWindow.backgroundColor = [UIColor colorWithRed:0.85 green:0.92 blue:1.0 alpha:alpha];
+    CGFloat alpha = k * 0.12;
+    g_overlayWindow.backgroundColor = [UIColor colorWithRed:0.88 green:0.93 blue:1.0 alpha:alpha];
 }
 
 // ========== 主入口 ==========
@@ -116,19 +160,13 @@ static void CWApply(void) {
     temp = MAX(0, MIN(100, temp));
 
     if (!enabled || temp == 0) {
-        // 关闭或强度为 0，恢复原厂
         BOOL ok = restoreHardwareGamma();
-        if (!ok) {
-            applyOverlayGamma(0);
-        }
+        if (!ok) applyOverlayGamma(0);
         return;
     }
 
-    // 应用冷白
     BOOL ok = applyHardwareGamma((CGFloat)temp);
-    if (!ok) {
-        applyOverlayGamma((CGFloat)temp);
-    }
+    if (!ok) applyOverlayGamma((CGFloat)temp);
 }
 
 static void CWNotify(CFNotificationCenterRef c, void *o, CFStringRef n,
@@ -143,6 +181,7 @@ static void CWNotify(CFNotificationCenterRef c, void *o, CFStringRef n,
         NULL, CWNotify, CFSTR("com.chatgpt.coldwhite/reload"), NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    // 延迟 5 秒，等 SpringBoard 完全启动
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ CWApply(); });
 }
