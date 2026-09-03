@@ -1,0 +1,9 @@
+Package: com.chatgpt.coldwhite
+Name: Cold White
+Version: 0.6.0
+Architecture: iphoneos-arm64
+Description: Experimental system-wide cool-white controller for iOS 17 jailbreaks.
+Maintainer: ColdWhite
+Author: ColdWhite
+Section: Tweaks
+Depends: mobilesubstrate, preferenceloader
