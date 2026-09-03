@@ -46,7 +46,6 @@ static NSString * const kDomain = @"com.chatgpt.coldwhite";
     [d setInteger:0 forKey:@"Temperature"];
     [d synchronize];
     [self notify];
-    [self reloadSpecifiers];
 }
 
 - (void)notify {
